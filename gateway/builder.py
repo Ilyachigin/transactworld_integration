@@ -1,8 +1,12 @@
+import copy
+import json
 import jwt
 import base64
 import hashlib
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Union, Any
+from decimal import Decimal, ROUND_HALF_UP
+
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
@@ -12,26 +16,44 @@ from utils.db import DatabaseStorage
 
 db = DatabaseStorage()
 
+card_brand = {
+    "Visa": "VISA",
+    "MasterCard": "MC"
+}
+
 
 def gateway_body(business_data: Dict) -> Dict:
-    request_body = business_data.get("payment", {})
-    extra_return_param = business_data.get("params", {}).get("extra_return_param")
-    payment_brand = extra_return_param or business_data.get("settings", {}).get("method")
+    payment_body = business_data.get("payment", {})
+    params_body = business_data.get("params", {})
 
-    return {
+    is_card = bool(params_body.get("pan"))
+
+    if params_body.get("pan"):
+        payment_brand = card_brand.get(payment_body.get("card_brand_name"))
+        payment_mode = "CC"
+    else:
+        extra_return_param = params_body.get("extra_return_param")
+        payment_brand = extra_return_param or business_data.get("settings", {}).get("method")
+        payment_mode = "EW"
+
+    request_body = {
         **authentication_params(business_data, payment_brand),
-        **shipping_params(business_data),
-        **customer_params(business_data),
-        "paymentMode": "EW",
+        **shipping_params(business_data, is_card),
+        **customer_params(business_data, is_card),
+        "paymentMode": payment_mode,
         "paymentType": "DB",
         "paymentBrand": payment_brand,
-        "merchantTransactionId": request_body.get("token"),
-        "amount": f"{request_body.get('gateway_amount') / 100:.2f}",
-        "currency": request_body.get("gateway_currency"),
+        "merchantTransactionId": payment_body.get("token"),
+        "amount": amount_convert(payment_body.get('gateway_amount')),
+        "currency": payment_body.get("gateway_currency"),
         "merchantRedirectUrl": business_data.get("processing_url"),
         "notificationUrl": f"{config.BASE_URL}/callback"
     }
+    if is_card:
+        request_body.update(browser_params(params_body))
+        request_body.update(card_params(params_body))
 
+    return request_body
 
 def gateway_status_body(business_data: Dict) -> Dict:
     return {
@@ -51,7 +73,7 @@ def gateway_refund_body(business_data: dict) -> dict:
         "authentication.memberId": business_data.get("settings", {}).get("member_id"),
         "authentication.checksum": check_sum(business_data, refund=True),
         "paymentType": "RF",
-        "amount": f"{refund_amount / 100:.2f}",
+        "amount": amount_convert(refund_amount),
         "paymentId": request_body.get("gateway_token")
     }
 
@@ -73,7 +95,7 @@ def gateway_callback_body(data: dict) -> tuple[str | None, dict[str, str | int]]
         "status": status,
         "response": logs_response,
         "currency": data.get("currency"),
-        "amount": int(float(data.get("amount")) * 100)
+        "amount": amount_convert(data.get("amount"), reverse=True)
     }
 
     callback_body["logs"] = response_logs_params(auth_data=None, pay_data=callback_body)
@@ -116,7 +138,7 @@ def gateway_auth_response(auth_data: dict) -> str:
 
 def gateway_status_response(auth_data: dict, pay_data: dict):
     gateway_response = pay_data.get("response", {}).get("response", {})
-    amount = float(gateway_response.get("amount")) * 100
+    amount = amount_convert(gateway_response.get("amount"), reverse=True)
     currency = gateway_response.get("currency")
     status = status_mapping(gateway_response.get("transactionStatus"))
     description = gateway_response.get("result", {}).get("description")
@@ -131,25 +153,11 @@ def gateway_status_response(auth_data: dict, pay_data: dict):
     }
 
 
-def gateway_refund_decline_response(auth_data: dict, pay_data: dict | str): # temp method for refund disable
-    reason =  "Refund not supported by API"
-    amount = int(float(pay_data.get("params", {}).get("amount")) * 100)
-
-    result = {
-        "result": "OK",
-        "status": 'declined',
-        "details":  reason,
-        "amount": amount,
-        "logs": response_logs_params(auth_data, pay_data)
-    }
-    return result
-
-
 def gateway_decline_response(auth_data: dict, pay_data: dict | str):
     request_body = pay_data.get("body", {})
     gateway_response = pay_data.get("response", {}).get("response", {})
     reason = gateway_response.get("result", {}).get("description") or "Transaction declined"
-    amount = int(float(request_body.get("amount")) * 100)
+    amount = amount_convert(request_body.get("amount"), reverse=True)
 
     result = {
         "result": "OK",
@@ -161,21 +169,29 @@ def gateway_decline_response(auth_data: dict, pay_data: dict | str):
     return result
 
 
-def customer_params(business_data: dict) -> Dict:
-    request_body = business_data.get("params", {}).get("customer")
+def customer_params(business_data: dict, is_card: bool) -> Dict:
+    params_data = business_data.get("params", {})
+    request_body = params_data if is_card else params_data.get("customer")
+
     phone = request_body.get("phone", "")
 
     params = {
         "customer.telnocc": phone[:3] if phone.startswith("+") else "+" + phone[:2],
         "customer.phone": phone[3:] if phone.startswith("+") else phone[2:],
-        "customer.email": request_body.get("email")
+        "customer.email": request_body.get("email"),
+        "customer.givenName": request_body.get("first_name"),
+        "customer.surname": request_body.get("last_name"),
+        "customer.ip": request_body.get("ip") or business_data.get("payment", {}).get("ip"),
+        "customer.birthDate": request_body.get("birthday"),
+
     }
 
-    return {k: v for k, v in params.items() if v is not None}
+    return clean_data(params)
 
 
-def shipping_params(business_data: dict) -> Dict:
-    request_body = business_data.get("params", {}).get("customer")
+def shipping_params(business_data: dict, is_card: bool) -> Dict:
+    params_data = business_data.get("params", {})
+    request_body = params_data if is_card else params_data.get("customer")
 
     params = {
         "shipping.country": request_body.get("country"),
@@ -187,16 +203,21 @@ def shipping_params(business_data: dict) -> Dict:
         "shipping.surname": request_body.get("last_name")
     }
 
-    return {k: v for k, v in params.items() if v is not None}
+    return clean_data(params)
 
 
 def authentication_params(business_data: dict, payment_brand: str) -> Dict:
     settings_body = business_data.get("settings", {})
+    terminal_brand = None
 
     if payment_brand.upper() == "APPLEPAY":
         terminal_brand = settings_body.get("apple_terminal_id")
-    else:
+    elif payment_brand.upper() == "GOOGLEPAY":
         terminal_brand = settings_body.get("google_terminal_id")
+    elif payment_brand.upper() == "VISA":
+        terminal_brand = settings_body.get("visa_terminal_id")
+    elif payment_brand.upper() == "MC":
+        terminal_brand = settings_body.get("mc_terminal_id")
 
     params = {
         "authentication.memberId": settings_body.get("member_id"),
@@ -204,7 +225,38 @@ def authentication_params(business_data: dict, payment_brand: str) -> Dict:
         "authentication.terminalId": terminal_brand
     }
 
-    return {k: v for k, v in params.items() if v is not None}
+    return clean_data(params)
+
+
+def browser_params(data: dict) -> Dict:
+    browser_data = data.get("browser", {})
+
+    params = {
+        "deviceDetails.browserAcceptHeader": browser_data.get("accept_header"),
+        "deviceDetails.browserColorDepth": browser_data.get("color_depth"),
+        "deviceDetails.browserLanguage": browser_data.get("language", "en-US")[:5],
+        "deviceDetails.browserScreenHeight": browser_data.get("screen_height"),
+        "deviceDetails.browserScreenWidth": browser_data.get("screen_width"),
+        "deviceDetails.browserTimezoneOffset": browser_data.get("tz"),
+        "deviceDetails.user_Agent": browser_data.get("user_agent"),
+        "deviceDetails.browserJavaEnabled": bool(browser_data.get("java_enabled"))
+    }
+
+    return clean_data(params)
+
+
+def card_params(data: dict) -> Dict:
+    month, year = data.get("expires").split("/")
+    card_number = data.get("pan", "").replace("-", "")
+
+    params = {
+        "card.number": card_number,
+        "card.expiryMonth": int(month),
+        "card.expiryYear": int(year),
+        "card.cvv": data.get("cvv")
+    }
+
+    return clean_data(params)
 
 
 def check_sum(business_data: dict, status=False, refund=False) -> str:
@@ -223,7 +275,7 @@ def check_sum(business_data: dict, status=False, refund=False) -> str:
 
     amount = None
     if gateway_amount is not None:
-        amount = f"{gateway_amount / 100:.2f}"
+        amount = amount_convert(gateway_amount)
     if status:
         # <memberId>|<secureKey>|<paymentId>
         raw = f"{member_id}|{secure_key}|{transaction_token}"
@@ -256,7 +308,7 @@ def response_logs_params(auth_data, pay_data) -> list | dict:
             "gateway": "Transactworld",
             "request": {
                 "url": data.get("url"),
-                "params": data.get("body")
+                "params": mask_data(data.get("body"))
             },
             "status": data.get("response", {}).get("status_code"),
             "response": data.get("response", {}).get("response"),
@@ -326,11 +378,8 @@ def headers_param(auth_token: str = None) -> dict:
 def response_handler(request_type, auth_data: dict | None, pay_data: dict):
     gateway_response = pay_data.get("response", {}).get("response", {})
 
-    if  request_type == "refund": # temp
-        return gateway_refund_decline_response(auth_data, pay_data)
-
     if pay_data["response"].get("status") == "ok" and gateway_response.get("paymentId") not in ("-", None):
-        if request_type == "pay": #in ["pay", "refund"]:
+        if request_type in ["pay", "refund"]:
             return gateway_pay_response(auth_data, pay_data)
         elif request_type == "status":
             return gateway_status_response(auth_data, pay_data)
@@ -344,4 +393,36 @@ def database_insert(data: dict, bearer_token: str):
     if token:
         db.insert_token(token, bearer_token)
         db.delete_old_tokens()
+
+
+def clean_data(params: dict) -> dict:
+    return {k: v for k, v in params.items() if v is not None and v != ""}
+
+
+def mask_data(data: Union[dict, str]) -> dict | None | Any:
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return data
+    if not data:
+        return data
+
+    masked = copy.deepcopy(data)
+
+    if masked.get("card.number"):
+        pan = str(masked["card.number"]).replace(" ", "")
+        masked["card.number"] = f"{pan[:6]}******{pan[-4:]}" if len(pan) >= 10 else "************"
+
+    if masked.get("card.cvv"):
+        masked["card.cvv"] = "***"
+
+    return masked
+
+
+def amount_convert(value, reverse: bool = False) -> int | Decimal:
+    if not reverse:
+        return (Decimal(value) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    return int((Decimal(str(value)) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 

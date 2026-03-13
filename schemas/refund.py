@@ -6,7 +6,6 @@ class InnerParams(BaseModel):
 
 class PaymentInfo(BaseModel):
     gateway_amount: int
-    token: str
     gateway_token: str
     gateway_currency: str
 

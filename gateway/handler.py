@@ -26,7 +26,6 @@ from gateway.builder import (
 
 async def handle_pay(data: PaymentRequest):
     raw_data = data.model_dump(exclude_none=True)
-    logger.info(f"Business request body: {raw_data}")
 
     bearer_token = raw_data.get("payment", {}).get("merchant_private_key")
     settings = raw_data.get("settings", {})
@@ -87,27 +86,27 @@ async def handle_refund(data: RefundRequest):
     raw_data = data.model_dump(exclude_none=True)
     logger.info(f"Business request body: {raw_data}")
 
-    # settings = raw_data.get("settings", {})
-    # gateway_token = raw_data.get("payment").get("gateway_token")
-    #
-    # auth_token = db.get_auth_token(settings.get("username"))
-    # auth_data = None
-    # if not auth_token:
-    #     auth_data, auth_token = handle_auth_token(settings)
-    #
-    # url = f"{config.GATEWAY_URL}/refund/{gateway_token}"
-    # gateway_payload = gateway_refund_body(raw_data)
-    # headers = headers_param(auth_token)
+    settings = raw_data.get("settings", {})
+    gateway_token = raw_data.get("payment").get("gateway_token")
 
-    #response = send_request('POST', url, headers, gateway_payload)
+    auth_token = db.get_auth_token(settings.get("username"))
+    auth_data = None
+    if not auth_token:
+        auth_data, auth_token = handle_auth_token(settings)
 
-    # refund_data = {
-    #     "kind": "refund",
-    #     "url": url,
-    #     "body": gateway_payload,
-    #     "response": response
-    # }
-    return response_handler('refund', auth_data=None, pay_data=raw_data)
+    url = f"{config.GATEWAY_URL}/refund/{gateway_token}"
+    gateway_payload = gateway_refund_body(raw_data)
+    headers = headers_param(auth_token)
+
+    response = send_request('POST', url, headers, gateway_payload)
+
+    refund_data = {
+        "kind": "refund",
+        "url": url,
+        "body": gateway_payload,
+        "response": response
+    }
+    return response_handler('refund', auth_data, refund_data)
 
 
 async def handle_callback(data: GatewayCallback):

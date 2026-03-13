@@ -2,13 +2,14 @@ import time
 import requests
 
 from utils.logger import logger
+from gateway.builder import mask_data
 
 
 def send_request(method: str, url: str, headers: dict, payload: dict | str, json=False) -> dict:
     start_time = time.perf_counter()
 
     logger.info(f"Gateway request URL: {url}")
-    logger.info(f"Gateway request params: {payload}")
+    logger.info(f"Gateway request params: {mask_data(payload)}")
 
     try:
         if method == "POST":
